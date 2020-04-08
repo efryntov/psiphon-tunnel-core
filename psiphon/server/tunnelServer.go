@@ -2475,9 +2475,10 @@ func (sshClient *sshClient) enqueueAlertRequest(request protocol.AlertRequest) {
 	}
 }
 
-func (sshClient *sshClient) enqueueDisallowedTrafficAlertRequest() {
+func (sshClient *sshClient) enqueueDisallowedTrafficAlertRequest(subject string) {
 	sshClient.enqueueAlertRequest(protocol.AlertRequest{
-		Reason: protocol.PSIPHON_API_ALERT_DISALLOWED_TRAFFIC,
+		Reason:  protocol.PSIPHON_API_ALERT_DISALLOWED_TRAFFIC,
+		Subject: subject,
 	})
 }
 
@@ -2909,11 +2910,13 @@ func (sshClient *sshClient) isPortForwardPermitted(
 
 	sshClient.Lock()
 
+	var alertSubject string
 	allowed := true
 
 	// Client must complete handshake before port forwards are permitted.
 	if !sshClient.handshakeState.completed {
 		allowed = false
+		alertSubject = "Handshake incomplete"
 	}
 
 	if allowed {
@@ -2922,10 +2925,12 @@ func (sshClient *sshClient) isPortForwardPermitted(
 		case portForwardTypeTCP:
 			if !sshClient.trafficRules.AllowTCPPort(remoteIP, port) {
 				allowed = false
+				alertSubject = "TCP:" + remoteIP.String() + ":" + strconv.Itoa(port)
 			}
 		case portForwardTypeUDP:
 			if !sshClient.trafficRules.AllowUDPPort(remoteIP, port) {
 				allowed = false
+				alertSubject = "UDP:" + remoteIP.String() + ":" + strconv.Itoa(port)
 			}
 		}
 	}
@@ -2943,7 +2948,7 @@ func (sshClient *sshClient) isPortForwardPermitted(
 		sshClient.updateQualityMetricsWithUDPRejectedDisallowed()
 	}
 
-	sshClient.enqueueDisallowedTrafficAlertRequest()
+	sshClient.enqueueDisallowedTrafficAlertRequest(alertSubject)
 
 	log.WithTraceFields(
 		LogFields{
