@@ -405,12 +405,6 @@ func (tunnel *Tunnel) Dial(
 
 	go func() {
 		sshPortForwardConn, err := tunnel.sshClient.Dial("tcp", remoteAddr)
-		if err != nil {
-			singletonNoticeLogger.outputNotice(
-				"HACK", 0,
-				"error", err,
-				"addr", remoteAddr)
-		}
 		resultChannel <- &tunnelDialResult{sshPortForwardConn, err}
 	}()
 

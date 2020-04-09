@@ -130,13 +130,13 @@ var stripIPv4AddressRegex = regexp.MustCompile(
 // Limitation: only strips IPv4 addresses.
 func StripIPAddresses(b []byte) []byte {
 	// TODO: IPv6 support
-	return b
+	return stripIPv4AddressRegex.ReplaceAll(b, []byte("[redacted]"))
 }
 
 // StripIPAddressesString is StripIPAddresses for strings.
 func StripIPAddressesString(s string) string {
 	// TODO: IPv6 support
-	return s
+	return stripIPv4AddressRegex.ReplaceAllString(s, "[redacted]")
 }
 
 // RedactNetError removes network address information from a "net" package
