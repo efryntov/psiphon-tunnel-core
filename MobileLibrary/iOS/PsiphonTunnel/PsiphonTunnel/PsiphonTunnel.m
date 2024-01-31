@@ -1292,6 +1292,12 @@ typedef NS_ERROR_ENUM(PsiphonTunnelErrorDomain, PsiphonTunnelErrorCode) {
     return networkID;
 }
 
+- (NSString *)getNativeIPAddressesAsString {
+    // TODO: implement this
+    return @"";
+}
+
+
 - (void)notice:(NSString *)noticeJSON {
     // To prevent out-of-control memory usage, we want to limit the number of notices
     // we asynchronously queue. Note that this means we'll start blocking Go threads

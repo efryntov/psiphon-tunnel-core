@@ -62,6 +62,13 @@ type PsiphonProvider interface {
 	// addresses. A single string return value is used since gobind does not
 	// support string slice types.
 	GetDNSServersAsString() string
+
+	// GetNativeIPAddressesAsString must return a coma-delimited list of usable
+	// IP addresses. A single string return value is used since gobind does not
+	// support string slice types.
+	// If the provider does not support this function or no IPs available, it
+	// should return an empty string.
+	GetNativeIPAddressesAsString() string
 }
 
 type PsiphonProviderFeedbackHandler interface {
@@ -554,4 +561,20 @@ func (p *mutexPsiphonProvider) GetNetworkID() string {
 	p.Lock()
 	defer p.Unlock()
 	return p.p.GetNetworkID()
+}
+
+func (p *mutexPsiphonProvider) GetNativeIPAddressesAsString() string {
+	p.Lock()
+	defer p.Unlock()
+	return p.p.GetNativeIPAddressesAsString()
+}
+
+func (p *mutexPsiphonProvider) GetNativeIPAddresses() []string {
+	p.Lock()
+	defer p.Unlock()
+	s := p.p.GetNativeIPAddressesAsString()
+	if s == "" {
+		return []string{}
+	}
+	return strings.Split(s, ",")
 }

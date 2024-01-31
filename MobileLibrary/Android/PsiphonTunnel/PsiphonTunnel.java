@@ -23,6 +23,7 @@ import android.annotation.TargetApi;
 import android.content.Context;
 import android.net.ConnectivityManager;
 import android.net.LinkProperties;
+import android.net.LinkAddress;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
@@ -145,7 +146,11 @@ public class PsiphonTunnel {
     private AtomicReference<String> mClientPlatformPrefix;
     private AtomicReference<String> mClientPlatformSuffix;
     private final boolean mShouldRouteThroughTunnelAutomatically;
+    private Network currentActiveNetwork;
+    private boolean isNetworkSetupFirstRun = true;
     private final NetworkMonitor mNetworkMonitor;
+    // flag to indicate whether we can use the native IP address detection
+    private boolean mHasNativeIPaddresses = false;
     private AtomicReference<String> mActiveNetworkType;
     private AtomicReference<String> mActiveNetworkDNSServers;
 
@@ -203,7 +208,29 @@ public class PsiphonTunnel {
         mActiveNetworkDNSServers = new AtomicReference<String>("");
         mNetworkMonitor = new NetworkMonitor(new NetworkMonitor.NetworkChangeListener() {
             @Override
-            public void onChanged() {
+            public void onNetworkAvailable(Network network) {
+                if (!network.equals(currentActiveNetwork)) {
+                    setCurrentActiveNetworkAndProperties(network);
+
+                    if (isNetworkSetupFirstRun) {
+                        isNetworkSetupFirstRun = false;
+                    } else {
+                        // Active network changed, reconnect tunnel
+                        reconnectTunnel();
+                    }
+                }
+            }
+
+            @Override
+            public void onNetworkLost(Network network) {
+                if (network.equals(currentActiveNetwork)) {
+                    setCurrentActiveNetworkAndProperties(null);
+                    // Active network is lost, reconnect tunnel
+                    reconnectTunnel();
+                }
+            }
+
+            private void reconnectTunnel() {
                 try {
                     reconnectPsiphon();
                 } catch (Exception e) {
@@ -211,6 +238,13 @@ public class PsiphonTunnel {
                 }
             }
         });
+
+        // Set the flag to indicate whether we can use the native IP address detection
+        // The detection is available on Lolipop and above and only if the device has
+        // a connectivity service
+        mHasNativeIPaddresses =
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP &&
+                        hostService.getContext().getSystemService(Context.CONNECTIVITY_SERVICE) != null;
     }
 
     public Object clone() throws CloneNotSupportedException {
@@ -705,6 +739,11 @@ public class PsiphonTunnel {
         public String getNetworkID() {
             return PsiphonTunnel.getNetworkID(mHostService.getContext(), mPsiphonTunnel.isVpnMode());
         }
+
+        @Override
+        public String getNativeIPAddressesAsString() {
+            return mPsiphonTunnel.getNativeIPAddressesAsString(mHostService.getContext(), mHostService);
+        }
     }
 
     private void notice(String noticeJSON) {
@@ -863,6 +902,44 @@ public class PsiphonTunnel {
         return networkID;
     }
 
+    // Attempt to return a comma-delimited list of usable IP addresses from the current active network.
+    // If the active network is unavailable, attempt to return usable IP addresses from all networks.
+    private String getNativeIPAddressesAsString(Context context, HostLogger logger) {
+        // If the device does not support the native IP address detection, return an empty string.
+        if (!mHasNativeIPaddresses) {
+            return "";
+        }
+        List<String> ipAddresses = new ArrayList<>();
+        try {
+            ConnectivityManager connectivityManager =
+                    (ConnectivityManager)context.getSystemService(Context.CONNECTIVITY_SERVICE);
+
+            // Initially, attempt to use the active network
+            Network[] networks = currentActiveNetwork != null ? new Network[]{currentActiveNetwork} : connectivityManager.getAllNetworks();
+
+            for (Network network : networks) {
+                LinkProperties linkProperties = connectivityManager.getLinkProperties(network);
+                if (linkProperties != null) {
+                    for (LinkAddress linkAddress : linkProperties.getLinkAddresses()) {
+                        InetAddress address = linkAddress.getAddress();
+                        // Check if the IP address is loopback, link-local, or multicast
+                        if (!address.isLoopbackAddress() &&
+                                !address.isLinkLocalAddress() &&
+                                !address.isMulticastAddress()) {
+                            ipAddresses.add(address.getHostAddress());
+                        }
+                    }
+                }
+            }
+        } catch (java.lang.Exception e) {
+            logger.onDiagnosticMessage("failed to get native IP addresses: " + e.getMessage());
+            return "";
+        }
+        // Join the IP addresses into a comma-delimited string.
+        // If the list is empty, this will return an empty string.
+        return TextUtils.join(",", ipAddresses);
+    }
+
     //----------------------------------------------------------------------------------------------
     // Psiphon Tunnel Core
     //----------------------------------------------------------------------------------------------
@@ -874,7 +951,7 @@ public class PsiphonTunnel {
         try {
             // mNetworkMonitor.start() will wait up to 1 second before returning to give the network
             // callback a chance to populate active network properties before we start the tunnel.
-            mNetworkMonitor.start(mHostService.getContext());
+            mNetworkMonitor.start(mHostService.getContext(), isVpnMode());
             Psi.start(
                     loadPsiphonConfig(mHostService.getContext()),
                     embeddedServerEntries,
@@ -1557,6 +1634,62 @@ public class PsiphonTunnel {
         }
     }
 
+    private void setCurrentActiveNetworkAndProperties(Network network) {
+        currentActiveNetwork = network;
+
+        if (network == null) {
+            mActiveNetworkType.set("NONE");
+            mActiveNetworkDNSServers.set("");
+            mHostService.onDiagnosticMessage("NetworkMonitor: clear current active network");
+        } else {
+            String networkType = "UNKNOWN";
+
+            ConnectivityManager connectivityManager =
+                    (ConnectivityManager) mHostService.getContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+
+            try {
+                // Limitation: a network may have both CELLULAR
+                // and WIFI transports, or different network
+                // transport types entirely. This logic currently
+                // mimics the type determination logic in
+                // getNetworkID.
+                NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+                if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                    networkType = "VPN";
+                } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                    networkType = "MOBILE";
+                } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    networkType = "WIFI";
+                }
+            } catch (java.lang.Exception e) {
+            }
+            mActiveNetworkType.set(networkType);
+
+            ArrayList<String> servers = new ArrayList<String>();
+            try {
+                LinkProperties linkProperties = connectivityManager.getLinkProperties(network);
+                List<InetAddress> serverAddresses = linkProperties.getDnsServers();
+                for (InetAddress serverAddress : serverAddresses) {
+                    String server = serverAddress.toString();
+                    if (server.startsWith("/")) {
+                        server = server.substring(1);
+                    }
+                    servers.add(server);
+                }
+            } catch (java.lang.Exception e) {
+            }
+            // Use the workaround, comma-delimited format required for gobind.
+            mActiveNetworkDNSServers.set(TextUtils.join(",", servers));
+
+            String message = "NetworkMonitor: set current active network " + networkType;
+            if (!servers.isEmpty()) {
+                // The DNS server address is potential PII and not logged.
+                message += " with DNS";
+            }
+            mHostService.onDiagnosticMessage(message);
+        }
+    }
+
     //----------------------------------------------------------------------------------------------
     // Network connectivity monitor
     //----------------------------------------------------------------------------------------------
@@ -1569,9 +1702,7 @@ public class PsiphonTunnel {
             this.listener = listener;
         }
 
-        private void start(Context context) throws InterruptedException {
-            final CountDownLatch setNetworkPropertiesCountDownLatch = new CountDownLatch(1);
-
+        private void start(Context context, boolean isVpnMode) throws InterruptedException {
             // Need API 21(LOLLIPOP)+ for ConnectivityManager.NetworkCallback
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
                 return;
@@ -1581,90 +1712,12 @@ public class PsiphonTunnel {
             if (connectivityManager == null) {
                 return;
             }
+
+            final CountDownLatch networkMonitorCountDownLatch = new CountDownLatch(1);
+
             networkCallback = new ConnectivityManager.NetworkCallback() {
                 private boolean isInitialState = true;
                 private Network currentActiveNetwork;
-
-                private void consumeActiveNetwork(Network network) {
-                    if (isInitialState) {
-                        isInitialState = false;
-                        setCurrentActiveNetworkAndProperties(network);
-                        return;
-                    }
-
-                    if (!network.equals(currentActiveNetwork)) {
-                        setCurrentActiveNetworkAndProperties(network);
-                        if (listener != null) {
-                            listener.onChanged();
-                        }
-                    }
-                }
-
-                private void consumeLostNetwork(Network network) {
-                    if (network.equals(currentActiveNetwork)) {
-                        setCurrentActiveNetworkAndProperties(null);
-                        if (listener != null) {
-                            listener.onChanged();
-                        }
-                    }
-                }
-
-                private void setCurrentActiveNetworkAndProperties(Network network) {
-
-                    currentActiveNetwork = network;
-
-                    if (network == null) {
-
-                        mPsiphonTunnel.mActiveNetworkType.set("NONE");
-                        mPsiphonTunnel.mActiveNetworkDNSServers.set("");
-                        mPsiphonTunnel.mHostService.onDiagnosticMessage("NetworkMonitor: clear current active network");
-
-                    } else {
-
-                        String networkType = "UNKNOWN";
-                        try {
-                            // Limitation: a network may have both CELLULAR
-                            // and WIFI transports, or different network
-                            // transport types entirely. This logic currently
-                            // mimics the type determination logic in
-                            // getNetworkID.
-                            NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
-                            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-                                networkType = "VPN";
-                            } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
-                                networkType = "MOBILE";
-                            } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                                networkType = "WIFI";
-                            }
-                        } catch (java.lang.Exception e) {
-                        }
-                        mPsiphonTunnel.mActiveNetworkType.set(networkType);
-
-                        ArrayList<String> servers = new ArrayList<String>();
-                        try {
-                            LinkProperties linkProperties = connectivityManager.getLinkProperties(network);
-                            List<InetAddress> serverAddresses = linkProperties.getDnsServers();
-                            for (InetAddress serverAddress : serverAddresses) {
-                                String server = serverAddress.toString();
-                                if (server.startsWith("/")) {
-                                    server = server.substring(1);
-                                }
-                                servers.add(server);
-                            }
-                        } catch (java.lang.Exception e) {
-                        }
-                        // Use the workaround, comma-delimited format required for gobind.
-                        mPsiphonTunnel.mActiveNetworkDNSServers.set(TextUtils.join(",", servers));
-
-                        String message = "NetworkMonitor: set current active network " + networkType;
-                        if (!servers.isEmpty()) {
-                            // The DNS server address is potential PII and not logged.
-                            message += " with DNS";
-                        }
-                        mPsiphonTunnel.mHostService.onDiagnosticMessage(message);
-                    }
-                    setNetworkPropertiesCountDownLatch.countDown();
-                }
 
                 @Override
                 public void onCapabilitiesChanged(Network network, NetworkCapabilities capabilities) {
@@ -1680,7 +1733,10 @@ public class PsiphonTunnel {
                     // For example, for a network with NET_CAPABILITY_INTERNET, it means that Internet connectivity was
                     // successfully detected.
                     if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
-                        consumeActiveNetwork(network);
+                        if (listener != null) {
+                            listener.onNetworkAvailable(network);
+                        }
+                        networkMonitorCountDownLatch.countDown();
                     }
                 }
 
@@ -1693,13 +1749,19 @@ public class PsiphonTunnel {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         return;
                     }
-                    consumeActiveNetwork(network);
+                    if (listener != null) {
+                        listener.onNetworkAvailable(network);
+                    }
+                    networkMonitorCountDownLatch.countDown();
                 }
 
                 @Override
                 public void onLost(Network network) {
                     super.onLost(network);
-                    consumeLostNetwork(network);
+                    if (listener != null) {
+                        listener.onNetworkLost(network);
+                    }
+                    networkMonitorCountDownLatch.countDown();
                 }
             };
 
@@ -1709,7 +1771,7 @@ public class PsiphonTunnel {
                         // Indicates that this network should be able to reach the internet.
                         .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
 
-                if (mPsiphonTunnel.mVpnMode.get()) {
+                if (isVpnMode) {
                     // If we are in the VPN mode then ensure we monitor only the VPN's underlying
                     // active networks and not self.
                     builder.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN);
@@ -1750,9 +1812,10 @@ public class PsiphonTunnel {
                 // Could be a security exception or any other runtime exception on customized firmwares.
                 networkCallback = null;
             }
-            // We are going to wait up to one second for the network callback to populate
-            // active network properties before returning.
-            setNetworkPropertiesCountDownLatch.await(1, TimeUnit.SECONDS);
+            // We are going to wait up to one second for the network callback to report network
+            // state. This is to ensure that we have the network properties populated before we
+            // start the tunnel.
+            networkMonitorCountDownLatch.await(1, TimeUnit.SECONDS);
         }
 
         private void stop(Context context) {
@@ -1780,7 +1843,8 @@ public class PsiphonTunnel {
         }
 
         public interface NetworkChangeListener {
-            void onChanged();
+            void onNetworkAvailable(Network network);
+            void onNetworkLost(Network network);
         }
     }
 }
